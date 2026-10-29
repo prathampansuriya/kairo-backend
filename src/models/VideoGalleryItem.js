@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { generatePosterFromVideoUrl } from '../services/mediaService.js';
 
 export const VideoGalleryItemSchema = new mongoose.Schema(
   {
@@ -47,8 +48,8 @@ export const VideoGalleryItemSchema = new mongoose.Schema(
     },
     thumbnailUrl: {
       type: String,
-      required: [true, 'Video poster / thumbnail URL is required'],
-      trim: true
+      trim: true,
+      default: ''
     },
     aspectRatio: {
       type: String,
@@ -135,8 +136,12 @@ VideoGalleryItemSchema.virtual('posterUrl')
     this.thumbnailUrl = val;
   });
 
-// Pre-save synchronization: set orientation based on aspect ratio
+// Helper: detect whether a URL points to a video file
+const isVideoFileUrl = (url = '') => /\.(mp4|webm|mov|mkv|avi|m3u8)(\?|$)/i.test(url);
+
+// Pre-save hook: sync orientation, auto-generate poster if needed
 VideoGalleryItemSchema.pre('save', function (next) {
+  // Set orientation from aspect ratio
   if (this.aspectRatio === '16:9') {
     this.orientation = 'landscape';
   } else if (this.aspectRatio === '9:16' || this.aspectRatio === '4:5') {
@@ -144,6 +149,27 @@ VideoGalleryItemSchema.pre('save', function (next) {
   } else if (this.aspectRatio === '1:1') {
     this.orientation = 'square';
   }
+
+  // Auto-generate poster if it's empty OR if it's still a video URL
+  const currentThumb = (this.thumbnailUrl || '').trim();
+  const needsPoster = !currentThumb || isVideoFileUrl(currentThumb);
+
+  if (needsPoster && this.videoUrl) {
+    try {
+      const poster = generatePosterFromVideoUrl(this.videoUrl);
+      if (poster) {
+        this.thumbnailUrl = poster;
+      } else if (!currentThumb) {
+        // Never leave it undefined / null — keep schema default ''
+        this.thumbnailUrl = '';
+      }
+    } catch (e) {
+      // Log but don't crash saving; poster generation is best-effort
+      // (e.g., cloudinary not configured)
+      if (!currentThumb) this.thumbnailUrl = '';
+    }
+  }
+
   next();
 });
 
@@ -154,5 +180,5 @@ VideoGalleryItemSchema.index({ linkedProduct: 1, publicationStatus: 1, isActive:
 VideoGalleryItemSchema.index({ linkedCollection: 1, publicationStatus: 1, isActive: 1 });
 
 export const VideoGalleryItem = mongoose.model('VideoGalleryItem', VideoGalleryItemSchema);
-export const VideoReel = VideoGalleryItem; // Alias for backward compatibility
+export const VideoReel = VideoGalleryItem;
 export default VideoGalleryItem;

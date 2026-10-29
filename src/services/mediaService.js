@@ -66,7 +66,6 @@ export const generateTransformations = (publicId, assetType = 'image', format = 
     ]
   });
 
-  // 16:9 landscape showcase (pad/fill preserving watch geometry)
   const showcase16x9Url = cloudinary.url(publicId, {
     resource_type: isVideo ? 'video' : 'image',
     transformation: [
@@ -80,7 +79,6 @@ export const generateTransformations = (publicId, assetType = 'image', format = 
     ]
   });
 
-  // 9:16 vertical reel showcase (pad/fill preserving watch center)
   const reel9x16Url = cloudinary.url(publicId, {
     resource_type: isVideo ? 'video' : 'image',
     transformation: [
@@ -96,19 +94,19 @@ export const generateTransformations = (publicId, assetType = 'image', format = 
 
   const posterThumbnailUrl = isVideo
     ? cloudinary.url(publicId, {
-        resource_type: 'video',
-        format: 'jpg',
-        transformation: [
-          {
-            start_offset: '0',
-            width: 720,
-            height: 1280,
-            crop: 'fill',
-            gravity: 'auto',
-            quality: 'auto'
-          }
-        ]
-      })
+      resource_type: 'video',
+      format: 'jpg',
+      transformation: [
+        {
+          start_offset: '0',
+          width: 720,
+          height: 1280,
+          crop: 'fill',
+          gravity: 'auto',
+          quality: 'auto'
+        }
+      ]
+    })
     : thumbnailUrl;
 
   return {
@@ -119,6 +117,63 @@ export const generateTransformations = (publicId, assetType = 'image', format = 
     reel9x16Url,
     posterThumbnailUrl
   };
+};
+
+/**
+ * Generates a video poster (first-frame JPG) URL from a Cloudinary video public_id.
+ */
+export const generateVideoThumbnail = (publicId, options = {}) => {
+  if (!publicId) return '';
+  const { width = 720, height = 1280 } = options;
+  return cloudinary.url(publicId, {
+    resource_type: 'video',
+    format: 'jpg',
+    transformation: [
+      {
+        start_offset: '0',
+        width,
+        height,
+        crop: 'fill',
+        gravity: 'auto',
+        quality: 'auto'
+      }
+    ]
+  });
+};
+
+/**
+ * Generates a poster thumbnail URL directly from a full Cloudinary video URL.
+ * Handles:
+ *   - Plain video URLs:          /video/upload/v123/folder/file.mp4
+ *   - With transformations:      /video/upload/q_auto,w_720/v123/folder/file.mp4
+ *   - Authenticated/private:     /video/upload/s--abc--/v123/folder/file.mp4
+ *   - HLS streams (.m3u8)        /video/upload/v123/folder/file.m3u8
+ * Returns '' for non-Cloudinary videos (cannot derive poster).
+ */
+export const generatePosterFromVideoUrl = (videoUrl, { width = 720, height = 1280 } = {}) => {
+  if (!videoUrl || typeof videoUrl !== 'string') return '';
+  const trimmed = videoUrl.trim();
+  if (!trimmed) return '';
+
+  // Already an image URL — return as-is
+  if (/\.(jpe?g|png|webp|avif)(\?|$)/i.test(trimmed)) return trimmed;
+
+  // Cloudinary video URL — inject a poster transformation
+  // Matches:  .../video/upload/(anything before /v123 or filename)/file.mp4|webm|mov|mkv|avi|m3u8
+  // We capture the base (`.../video/upload/`) and the path (including version + folders + filename)
+  const match = trimmed.match(
+    /^(https?:\/\/[^/]+\/video\/upload\/)(?:(?:[^/]+\/)?)([^/]+?\.(?:mp4|webm|mov|mkv|avi|m3u8))(\?.*)?$/i
+  );
+
+  if (match) {
+    const [, base, filename] = match;
+    // Build: base + transformations + filename-without-ext + .jpg
+    // Strip any existing transformation segment — we rebuild from scratch
+    const filenameWithoutExt = filename.replace(/\.[^.]+$/, '');
+    return `${base}so_0,w_${width},h_${height},c_fill,g_auto,q_auto/${filenameWithoutExt}.jpg`;
+  }
+
+  return '';
 };
 
 /**
@@ -161,7 +216,59 @@ export const uploadBufferToCloudinary = async (buffer, {
     });
 
     const readable = new Readable();
-    readable._read = () => {};
+    readable._read = () => { };
+    readable.push(buffer);
+    readable.push(null);
+    readable.pipe(uploadStream);
+  });
+};
+
+/**
+ * Uploads a video buffer and auto-generates a poster thumbnail from Cloudinary.
+ */
+export const uploadVideoWithThumbnail = async (buffer, {
+  folder = 'kairo/videos/streams',
+  width = 720,
+  height = 1280
+} = {}) => {
+  if (!isCloudinaryConfigured()) {
+    throw ApiError.internal(
+      'Cloudinary media provider is not configured. Please supply valid CLOUDINARY_* environment credentials.',
+      'CLOUDINARY_NOT_CONFIGURED'
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    const uploadOptions = {
+      folder,
+      resource_type: 'video',
+      timeout: 120000,
+      tags: ['kairo', 'video']
+    };
+
+    const uploadStream = cloudinary.uploader.upload_stream(uploadOptions, (error, result) => {
+      if (error) {
+        logger.error(`Cloudinary video upload failed: ${error.message}`, { error });
+        return reject(
+          ApiError.internal(`Video upload failed: ${error.message}`, 'CLOUDINARY_VIDEO_UPLOAD_FAILED')
+        );
+      }
+
+      const posterUrl = generateVideoThumbnail(result.public_id, { width, height });
+
+      resolve({
+        secureUrl: result.secure_url,
+        publicId: result.public_id,
+        format: result.format,
+        durationSeconds: result.duration || 0,
+        dimensions: { width: result.width || 0, height: result.height || 0 },
+        posterThumbnailUrl: posterUrl,
+        bytes: result.bytes
+      });
+    });
+
+    const readable = new Readable();
+    readable._read = () => { };
     readable.push(buffer);
     readable.push(null);
     readable.pipe(uploadStream);
@@ -222,7 +329,6 @@ export const processUpload = async (file, {
   const isVideo = file.mimetype.startsWith('video/');
   const resourceType = isVideo ? 'video' : 'image';
 
-  // Stream directly to Cloudinary
   const uploadResult = await uploadBufferToCloudinary(file.buffer, {
     folder,
     resourceType
@@ -262,9 +368,12 @@ export const processUpload = async (file, {
 
 export default {
   uploadBufferToCloudinary,
+  uploadVideoWithThumbnail,
   deleteFromCloudinary,
   cleanupUploadedAssets,
   processUpload,
   generateTransformations,
+  generateVideoThumbnail,
+  generatePosterFromVideoUrl,
   deriveAspectRatio
 };
